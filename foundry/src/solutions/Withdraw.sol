@@ -1,33 +1,45 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console} from "forge-std/Test.sol";
-import {IERC20} from "../interfaces/IERC20.sol";
-import {IPool} from "../interfaces/aave-v3/IPool.sol";
-import {POOL} from "../Constants.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {IERC20} from "../src/interfaces/IERC20.sol";
+import {POOL, WETH} from "../src/Constants.sol";
+import {IPool} from "../src/interfaces/aave-v3/IPool.sol";
+import {Withdraw} from "@exercises/Withdraw.sol";
 
-contract Withdraw {
-    IPool public constant pool = IPool(POOL);
+contract WithdrawTest is Test {
+    IERC20 private constant weth = IERC20(WETH);
+    IPool private constant pool = IPool(POOL);
+    IERC20 private aWeth;
+    Withdraw private target;
 
-    function supply(address token, uint256 amount) public {
-        IERC20(token).transferFrom(msg.sender, address(this), amount);
-        IERC20(token).approve(address(pool), amount);
-        pool.supply({
-            asset: token,
-            amount: amount,
-            onBehalfOf: address(this),
-            referralCode: 0
-        });
+    function setUp() public {
+        // Get aWETH address
+        IPool.ReserveData memory reserve = pool.getReserveData(WETH);
+        aWeth = IERC20(reserve.aTokenAddress);
+
+        deal(WETH, address(this), 1e18);
+        target = new Withdraw();
+
+        weth.approve(address(target), 1e18);
+        target.supply(WETH, 1e18);
+
+        // Let supply interest increase
+        skip(7 * 24 * 3600);
     }
 
-    function getSupplyBalance(address token) public view returns (uint256) {
-        IPool.ReserveData memory reserve = pool.getReserveData(token);
-        return IERC20(reserve.aTokenAddress).balanceOf(address(this));
-    }
+    function test_withdraw() public {
+        uint256 aWethBalBefore = aWeth.balanceOf(address(target));
+        uint256 withdrawn = target.withdraw(WETH);
+        uint256 aWethBalAfter = aWeth.balanceOf(address(target));
 
-    function withdraw(address token, uint256 amount) public returns (uint256) {
-        uint256 withdrawn =
-            pool.withdraw({asset: token, amount: amount, to: address(this)});
-        return withdrawn;
+        console.log("WETH balance: %e", aWethBalBefore);
+
+        assertGt(aWethBalBefore, 0, "aWETH balance = 0");
+        assertEq(aWethBalAfter, 0, "aWETH balance after");
+        assertEq(withdrawn, aWethBalBefore, "aWETH balance");
+        assertEq(
+            weth.balanceOf(address(target)), withdrawn, "WETH balance of target"
+        );
     }
 }

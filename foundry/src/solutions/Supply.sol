@@ -1,27 +1,42 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console} from "forge-std/Test.sol";
-import {IERC20} from "../interfaces/IERC20.sol";
-import {IPool} from "../interfaces/aave-v3/IPool.sol";
-import {POOL} from "../Constants.sol";
+import {Test} from "forge-std/Test.sol";
+import {IERC20} from "../src/interfaces/IERC20.sol";
+import {POOL, WETH} from "../src/Constants.sol";
+import {IPool} from "../src/interfaces/aave-v3/IPool.sol";
+import {Supply} from "@exercises/Supply.sol";
 
-contract Supply {
-    IPool public constant pool = IPool(POOL);
+contract SupplyTest is Test {
+    IERC20 private constant weth = IERC20(WETH);
+    IPool private constant pool = IPool(POOL);
+    IERC20 private aWeth;
+    Supply private target;
 
-    function supply(address token, uint256 amount) public {
-        IERC20(token).transferFrom(msg.sender, address(this), amount);
-        IERC20(token).approve(address(pool), amount);
-        pool.supply({
-            asset: token,
-            amount: amount,
-            onBehalfOf: address(this),
-            referralCode: 0
-        });
+    function setUp() public {
+        // Get aWETH address
+        IPool.ReserveData memory reserve = pool.getReserveData(WETH);
+        aWeth = IERC20(reserve.aTokenAddress);
+
+        deal(WETH, address(this), 1e18);
+        target = new Supply();
     }
 
-    function getSupplyBalance(address token) public view returns (uint256) {
-        IPool.ReserveData memory reserve = pool.getReserveData(token);
-        return IERC20(reserve.aTokenAddress).balanceOf(address(this));
+    function test_supply() public {
+        uint256 wethBalBefore = weth.balanceOf(address(this));
+        weth.approve(address(target), 1e18);
+        target.supply(WETH, 1e18);
+        uint256 wethBalAfter = weth.balanceOf(address(this));
+
+        assertEq(
+            wethBalBefore - wethBalAfter, 1e18, "WETH balance of test contract"
+        );
+        assertEq(weth.balanceOf(address(target)), 0, "WETH balance of target");
+        assertGt(aWeth.balanceOf(address(target)), 0, "aWETH balance of target");
+        assertEq(
+            target.getSupplyBalance(WETH),
+            aWeth.balanceOf(address(target)),
+            "Supply balance"
+        );
     }
 }

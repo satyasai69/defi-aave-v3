@@ -1,61 +1,68 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console} from "forge-std/Test.sol";
-import {IERC20} from "../interfaces/IERC20.sol";
-import {IPool} from "../interfaces/aave-v3/IPool.sol";
-import {IVariableDebtToken} from "../interfaces/aave-v3/IVariableDebtToken.sol";
-import {POOL} from "../Constants.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {IERC20} from "../src/interfaces/IERC20.sol";
+import {POOL, ORACLE, WETH, DAI} from "../src/Constants.sol";
+import {IPool} from "../src/interfaces/aave-v3/IPool.sol";
+import {IAaveOracle} from "../src/interfaces/aave-v3/IAaveOracle.sol";
+import {Repay} from "@exercises/Repay.sol";
 
-contract Repay {
-    IPool public constant pool = IPool(POOL);
+contract RepayTest is Test {
+    IERC20 private constant weth = IERC20(WETH);
+    IERC20 private constant dai = IERC20(DAI);
+    IPool private constant pool = IPool(POOL);
+    IAaveOracle private constant oracle = IAaveOracle(ORACLE);
+    IERC20 private debtToken;
+    Repay private target;
 
-    function supply(address token, uint256 amount) public {
-        IERC20(token).transferFrom(msg.sender, address(this), amount);
-        IERC20(token).approve(address(pool), amount);
-        pool.supply({
-            asset: token,
-            amount: amount,
-            onBehalfOf: address(this),
-            referralCode: 0
-        });
+    function setUp() public {
+        deal(WETH, address(this), 1e18);
+        target = new Repay();
+
+        weth.approve(address(target), 1e18);
+        target.supply(WETH, 1e18);
+
+        IPool.ReserveData memory reserve = pool.getReserveData(DAI);
+        debtToken = IERC20(reserve.variableDebtTokenAddress);
+
+        (,, uint256 availableToBorrowUsd,,,) =
+            pool.getUserAccountData(address(target));
+
+        // Approximate max borrow = available USD * DAI decimals / 1e8
+        // 1 USD = 1e8
+        uint256 approxMaxBorrow = availableToBorrowUsd * (10 ** 10);
+        // 50% of approx max borrow
+        uint256 borrowAmount = approxMaxBorrow * 50 / 100;
+        console.log("Approximate max borrow: %e", approxMaxBorrow);
+        console.log("Borrow amount: %e", borrowAmount);
+        target.borrow(DAI, borrowAmount);
+
+        // Mint DAI and allow target to spend
+        deal(DAI, address(this), 1000 * 1e18);
+        dai.approve(address(target), type(uint256).max);
     }
 
-    function borrow(address token, uint256 amount) public {
-        pool.borrow({
-            asset: token,
-            amount: amount,
-            // 1 = Stable interest rate
-            // 2 = Variable interest rate
-            interestRateMode: 2,
-            referralCode: 0,
-            onBehalfOf: address(this)
-        });
-    }
+    function test_repay() public {
+        // Test increase in debt over time
+        uint256 debt0 = debtToken.balanceOf(address(target));
+        console.log("Debt: %e", debt0);
+        assertEq(debt0, target.getVariableDebt(DAI), "debt 0");
 
-    function getVariableDebt(address token) public view returns (uint256) {
-        IPool.ReserveData memory reserve = pool.getReserveData(token);
-        return IERC20(reserve.variableDebtTokenAddress).balanceOf(address(this));
-    }
+        skip(7 * 24 * 3600);
 
-    function repay(address token) public returns (uint256) {
-        // msg.sender pays for interest on borrow.
-        // Transfer the difference (debt - balance in this contract)
-        uint256 bal = IERC20(token).balanceOf(address(this));
-        uint256 debt = getVariableDebt(token);
-        if (debt > bal) {
-            IERC20(token).transferFrom(msg.sender, address(this), debt - bal);
-        }
-        IERC20(token).approve(address(pool), debt);
+        uint256 debt1 = debtToken.balanceOf(address(target));
+        console.log("Debt: %e", debt1);
+        assertEq(debt1, target.getVariableDebt(DAI), "debt 1");
 
-        uint256 repaid = pool.repay({
-            asset: token,
-            // max = repay all debt
-            amount: type(uint256).max,
-            interestRateMode: 2,
-            onBehalfOf: address(this)
-        });
+        // Test repay
+        assertGt(debtToken.balanceOf(address(target)), 0, "debt before repay");
+        assertGt(dai.balanceOf(address(target)), 0, "DAI before repay");
 
-        return repaid;
+        uint256 repaid = target.repay(DAI);
+
+        assertEq(debtToken.balanceOf(address(target)), 0, "debt after repay");
+        assertEq(dai.balanceOf(address(target)), 0, "DAI after repay");
+        assertGt(repaid, 0, "repaid");
     }
 }

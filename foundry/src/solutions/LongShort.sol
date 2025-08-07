@@ -1,141 +1,199 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console} from "forge-std/Test.sol";
-import {IERC20} from "../interfaces/IERC20.sol";
-import {Aave} from "../lib/Aave.sol";
-import {Swap} from "../lib/Swap.sol";
-import {Math} from "../lib/Math.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {IERC20} from "../src/interfaces/IERC20.sol";
+import {
+    POOL,
+    ORACLE,
+    WETH,
+    DAI,
+    UNISWAP_V3_POOL_FEE_DAI_WETH
+} from "../src/Constants.sol";
+import {IPool} from "../src/interfaces/aave-v3/IPool.sol";
+import {IVariableDebtToken} from
+    "../src/interfaces/aave-v3/IVariableDebtToken.sol";
+import {IAaveOracle} from "../src/interfaces/aave-v3/IAaveOracle.sol";
+import {LongShort} from "@exercises/LongShort.sol";
 
-// NOTE: Don't use this contract in production.
-// Any caller can borrow on behalf of this contract and withdraw collateral from this contract.
+contract LongShortTest is Test {
+    IERC20 private constant weth = IERC20(WETH);
+    IERC20 private constant dai = IERC20(DAI);
+    IPool private constant pool = IPool(POOL);
+    IAaveOracle private constant oracle = IAaveOracle(ORACLE);
+    LongShort private target;
 
-contract LongShort is Aave, Swap {
-    struct OpenParams {
-        address collateralToken;
-        uint256 collateralAmount;
-        address borrowToken;
-        uint256 borrowAmount;
-        uint256 minHealthFactor;
-        uint256 minSwapAmountOut;
-        bytes swapData;
+    function setUp() public {
+        target = new LongShort();
     }
 
-    // Approve this contract to pull in collateral
-    // Approve this contract to borrow
-    function open(OpenParams memory params)
-        public
-        returns (uint256 collateralAmountOut)
-    {
-        require(params.minHealthFactor > 1e18, "min health factor <= 1");
+    function test_long_weth() public {
+        IPool.ReserveData memory debtReserve = pool.getReserveData(DAI);
 
-        // Transfer collateral
-        IERC20(params.collateralToken).transferFrom(
-            msg.sender, address(this), params.collateralAmount
+        // Test open
+        console.log("--- open ---");
+        IVariableDebtToken debtToken =
+            IVariableDebtToken(debtReserve.variableDebtTokenAddress);
+        debtToken.approveDelegation(address(target), type(uint256).max);
+
+        uint256 collateralAmount = 1e18;
+        uint256 borrowAmount = 1000 * 1e18;
+
+        deal(WETH, address(this), collateralAmount);
+        weth.approve(address(target), collateralAmount);
+
+        bytes memory swapData = abi.encode(UNISWAP_V3_POOL_FEE_DAI_WETH);
+
+        uint256 collateralAmountOut = target.open(
+            LongShort.OpenParams({
+                collateralToken: WETH,
+                collateralAmount: collateralAmount,
+                borrowToken: DAI,
+                borrowAmount: borrowAmount,
+                minHealthFactor: 1.5 * 1e18,
+                minSwapAmountOut: 1,
+                swapData: swapData
+            })
         );
 
-        // Supply collateral
-        IERC20(params.collateralToken).approve(
-            address(pool), params.collateralAmount
+        console.log("Collateral amount out: %e", collateralAmountOut);
+        assertGt(collateralAmountOut, 0, "collateral amount out = 0");
+        assertEq(
+            weth.balanceOf(address(this)),
+            collateralAmountOut,
+            "WETH balance of this contract"
         );
-        supply(params.collateralToken, params.collateralAmount, msg.sender);
+        assertEq(weth.balanceOf(address(target)), 0, "WETH balance of target");
 
-        // Borrow token
-        borrow(params.borrowToken, params.borrowAmount, msg.sender);
+        // Test close
+        console.log("--- Close ---");
+        IPool.ReserveData memory collateralReserve = pool.getReserveData(WETH);
+        IERC20 aToken = IERC20(collateralReserve.aTokenAddress);
+        aToken.approve(address(target), type(uint256).max);
 
-        // Check health factor
-        require(
-            getHealthFactor(msg.sender) >= params.minHealthFactor,
-            "health factor < min"
-        );
+        deal(DAI, address(this), 100 * 1e18);
+        dai.approve(address(target), 100 * 1e18);
 
-        // Swap borrowed token to collateral token
-        IERC20(params.borrowToken).approve(address(router), params.borrowAmount);
-        return swap({
-            tokenIn: params.borrowToken,
-            tokenOut: params.collateralToken,
-            amountIn: params.borrowAmount,
-            amountOutMin: params.minSwapAmountOut,
-            receiver: msg.sender,
-            data: params.swapData
-        });
-    }
+        uint256 wethBal = weth.balanceOf(address(this));
+        weth.approve(address(target), wethBal);
 
-    struct CloseParams {
-        address collateralToken;
-        uint256 collateralAmount;
-        uint256 maxCollateralToWithdraw;
-        address borrowToken;
-        uint256 maxDebtToRepay;
-        uint256 minSwapAmountOut;
-        bytes swapData;
-    }
+        uint256[2] memory balsBefore =
+            [weth.balanceOf(address(this)), dai.balanceOf(address(this))];
 
-    // Approve this contract to pull in collateral AToken
-    // Approve this contract to pull in collateral
-    // Approve this contract to pull in borrowed token if closing at a loss
-    function close(CloseParams memory params)
-        public
-        returns (
+        (
             uint256 collateralWithdrawn,
             uint256 debtRepaidFromMsgSender,
             uint256 borrowedLeftover
-        )
-    {
-        // Transfer collateral
-        IERC20(params.collateralToken).transferFrom(
-            msg.sender, address(this), params.collateralAmount
+        ) = target.close(
+            LongShort.CloseParams({
+                collateralToken: WETH,
+                collateralAmount: wethBal,
+                maxCollateralToWithdraw: type(uint256).max,
+                borrowToken: DAI,
+                maxDebtToRepay: type(uint256).max,
+                minSwapAmountOut: 1,
+                swapData: swapData
+            })
         );
 
-        // Swap collateral to borrowed token
-        IERC20(params.collateralToken).approve(
-            address(router), params.collateralAmount
+        uint256[2] memory balsAfter =
+            [weth.balanceOf(address(this)), dai.balanceOf(address(this))];
+
+        console.log("Collateral withdrawn: %e", collateralWithdrawn);
+        console.log("Debt repaid from msg.sender : %e", debtRepaidFromMsgSender);
+        console.log("Borrowed leftover: %e", borrowedLeftover);
+
+        assertGe(balsAfter[0], collateralAmount, "WETH balance");
+        assertGe(collateralWithdrawn, collateralAmount, "WETH withdrawn");
+        assertEq(
+            balsAfter[1],
+            balsBefore[1] - debtRepaidFromMsgSender + borrowedLeftover,
+            "DAI balance"
         );
-        uint256 amountOut = swap({
-            tokenIn: params.collateralToken,
-            tokenOut: params.borrowToken,
-            amountIn: params.collateralAmount,
-            amountOutMin: params.minSwapAmountOut,
-            receiver: address(this),
-            data: params.swapData
-        });
+    }
 
-        // Repay borrowed token
-        uint256 debtToRepay = Math.min(
-            getVariableDebt(params.borrowToken, msg.sender),
-            params.maxDebtToRepay
-        );
-        IERC20(params.borrowToken).approve(address(pool), debtToRepay);
-        uint256 repayAmount = 0;
-        if (debtToRepay > amountOut) {
-            // msg.sender repays for the difference
-            repayAmount = debtToRepay - amountOut;
-            IERC20(params.borrowToken).transferFrom(
-                msg.sender, address(this), repayAmount
-            );
-        }
-        repay(params.borrowToken, debtToRepay, msg.sender);
+    function test_short_weth() public {
+        IPool.ReserveData memory debtReserve = pool.getReserveData(WETH);
 
-        // Withdraw collateral to msg.sender
-        IERC20 aToken = IERC20(getATokenAddress(params.collateralToken));
-        aToken.transferFrom(
-            msg.sender,
-            address(this),
-            Math.min(
-                aToken.balanceOf(msg.sender), params.maxCollateralToWithdraw
-            )
+        // Test open
+        console.log("--- open ---");
+        IVariableDebtToken debtToken =
+            IVariableDebtToken(debtReserve.variableDebtTokenAddress);
+        debtToken.approveDelegation(address(target), type(uint256).max);
+
+        uint256 collateralAmount = 1000 * 1e18;
+        uint256 borrowAmount = 0.1 * 1e18;
+
+        deal(DAI, address(this), collateralAmount);
+        dai.approve(address(target), collateralAmount);
+
+        bytes memory swapData = abi.encode(UNISWAP_V3_POOL_FEE_DAI_WETH);
+
+        uint256 collateralAmountOut = target.open(
+            LongShort.OpenParams({
+                collateralToken: DAI,
+                collateralAmount: collateralAmount,
+                borrowToken: WETH,
+                borrowAmount: borrowAmount,
+                minHealthFactor: 1.5 * 1e18,
+                minSwapAmountOut: 1,
+                swapData: swapData
+            })
         );
 
-        uint256 withdrawn = withdraw(
-            params.collateralToken, params.maxCollateralToWithdraw, msg.sender
+        console.log("Collateral amount out: %e", collateralAmountOut);
+        assertGt(collateralAmountOut, 0, "collateral amount out = 0");
+        assertEq(
+            dai.balanceOf(address(this)),
+            collateralAmountOut,
+            "DAI balance of this contract"
+        );
+        assertEq(dai.balanceOf(address(target)), 0, "DAI balance of target");
+
+        // Test close
+        console.log("--- Close ---");
+        IPool.ReserveData memory collateralReserve = pool.getReserveData(DAI);
+        IERC20 aToken = IERC20(collateralReserve.aTokenAddress);
+        aToken.approve(address(target), type(uint256).max);
+
+        deal(WETH, address(this), 1e18);
+        weth.approve(address(target), 1e18);
+
+        uint256 daiBal = dai.balanceOf(address(this));
+        dai.approve(address(target), daiBal);
+
+        uint256[2] memory balsBefore =
+            [dai.balanceOf(address(this)), weth.balanceOf(address(this))];
+
+        (
+            uint256 collateralWithdrawn,
+            uint256 debtRepaidFromMsgSender,
+            uint256 borrowedLeftover
+        ) = target.close(
+            LongShort.CloseParams({
+                collateralToken: DAI,
+                collateralAmount: daiBal,
+                maxCollateralToWithdraw: type(uint256).max,
+                borrowToken: WETH,
+                maxDebtToRepay: type(uint256).max,
+                minSwapAmountOut: 1,
+                swapData: swapData
+            })
         );
 
-        // Transfer profit = swapped - repaid
-        uint256 bal = IERC20(params.borrowToken).balanceOf(address(this));
-        if (bal > 0) {
-            IERC20(params.borrowToken).transfer(msg.sender, bal);
-        }
+        uint256[2] memory balsAfter =
+            [dai.balanceOf(address(this)), weth.balanceOf(address(this))];
 
-        return (withdrawn, repayAmount, bal);
+        console.log("Collateral withdrawn: %e", collateralWithdrawn);
+        console.log("Debt repaid from msg.sender : %e", debtRepaidFromMsgSender);
+        console.log("Borrowed leftover: %e", borrowedLeftover);
+
+        assertGe(balsAfter[0], collateralAmount, "DAI balance");
+        assertGe(collateralWithdrawn, collateralAmount, "DAI withdrawn");
+        assertEq(
+            balsAfter[1],
+            balsBefore[1] - debtRepaidFromMsgSender + borrowedLeftover,
+            "WETH balance"
+        );
     }
 }

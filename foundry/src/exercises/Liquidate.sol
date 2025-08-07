@@ -14,11 +14,22 @@ contract Liquidate {
         public
     {
         // Task 1.1 - Get the amount of borrowed token that the user owes to Aave V3
+        IPool.ReserveData memory reserve = pool.getReserveData(borrowedToken);
 
         // Task 1.2 - Transfer the full borrowed amount from msg.sender
+        uint256 debt = IERC20(reserve.variableDebtTokenAddress).balanceOf(user);
+        IERC20(borrowedToken).transferFrom(msg.sender, address(this), debt);
 
         // Task 1.3 - Approve the pool contract to spend borrowed token from this contract
+        IERC20(borrowedToken).approve(address(pool), debt);
 
         // Task 1.4 - Call liquidate
+        pool.liquidationCall({
+            collateralAsset: collateral,
+            debtAsset: borrowedToken,
+            user: user,
+            debtToCover: debt,
+            receiveAToken: false
+        });
     }
 }

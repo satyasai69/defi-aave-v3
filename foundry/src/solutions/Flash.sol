@@ -1,39 +1,32 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console} from "forge-std/Test.sol";
-import {IERC20} from "../interfaces/IERC20.sol";
-import {IPool} from "../interfaces/aave-v3/IPool.sol";
-import {POOL} from "../Constants.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {IERC20} from "../src/interfaces/IERC20.sol";
+import {POOL, WETH, DAI} from "../src/Constants.sol";
+import {IPool} from "../src/interfaces/aave-v3/IPool.sol";
+import {Flash} from "@exercises/Flash.sol";
 
-contract Flash {
-    IPool public constant pool = IPool(POOL);
+contract FlashTest is Test {
+    IERC20 private constant dai = IERC20(DAI);
+    IPool private constant pool = IPool(POOL);
+    Flash private target;
 
-    function flash(address token, uint256 amount) public {
-        pool.flashLoanSimple({
-            receiverAddress: address(this),
-            asset: token,
-            amount: amount,
-            params: abi.encode(msg.sender),
-            referralCode: 0
-        });
+    function setUp() public {
+        deal(DAI, address(this), 1000 * 1e18);
+        target = new Flash();
+
+        dai.approve(address(target), 1000 * 1e18);
     }
 
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 fee,
-        address initiator,
-        bytes calldata params
-    ) public returns (bool) {
-        require(msg.sender == address(pool), "not authorized");
-        require(initiator == address(this), "invalid initiator");
-
-        address caller = abi.decode(params, (address));
-        IERC20(asset).transferFrom(caller, address(this), fee);
-
-        IERC20(asset).approve(msg.sender, amount + fee);
-
-        return true;
+    function test_flash() public {
+        vm.expectCall(
+            address(pool),
+            abi.encodeCall(
+                pool.flashLoanSimple,
+                (address(target), DAI, 1e6 * 1e18, abi.encode(address(this)), 0)
+            )
+        );
+        target.flash(DAI, 1e6 * 1e18);
     }
 }
